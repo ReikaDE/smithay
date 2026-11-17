@@ -6,9 +6,7 @@ use drm::control::{
     AtomicCommitFlags, Mode, PlaneType, connector, crtc, dumbbuffer::DumbBuffer, framebuffer, plane, property,
 };
 
-#[cfg(debug_assertions)]
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 #[cfg(debug_assertions)]
 use std::fmt;
 use std::os::unix::io::AsRawFd;
@@ -44,6 +42,9 @@ pub struct State {
     pub blob: property::Value<'static>,
     pub vrr: bool,
     pub connectors: HashSet<connector::Handle>,
+    /// Connector properties set through [`AtomicDrmSurface::set_connector_property`],
+    /// such as `Colorspace`, `HDR_OUTPUT_METADATA`, or `max bpc`.
+    pub connector_properties: HashMap<(connector::Handle, &'static str), property::Value<'static>>,
 }
 
 impl PartialEq for State {
@@ -53,6 +54,7 @@ impl PartialEq for State {
             && self.mode == other.mode
             && self.vrr == other.vrr
             && self.connectors == other.connectors
+            && self.connector_properties == other.connector_properties
     }
 }
 
@@ -150,6 +152,8 @@ impl State {
             // If we don't know the VRR state, the driver doesn't support the property
             vrr: vrr.unwrap_or(false),
             connectors: current_connectors,
+            // Only properties set through this surface are tracked.
+            connector_properties: HashMap::new(),
         })
     }
 
@@ -207,6 +211,7 @@ impl AtomicDrmSurface {
             blob,
             vrr: false,
             connectors: connectors.iter().copied().collect(),
+            connector_properties: HashMap::new(),
         };
 
         drop(_guard);
@@ -362,6 +367,7 @@ impl AtomicDrmSurface {
                 self.crtc,
                 Some(pending.blob),
                 pending.vrr,
+                &pending.connector_properties,
                 &connectors,
                 [],
                 [&plane_state],
@@ -421,6 +427,7 @@ impl AtomicDrmSurface {
             self.crtc,
             Some(pending.blob),
             pending.vrr,
+            &pending.connector_properties,
             &connectors,
             [&conn],
             [&plane_state],
@@ -478,6 +485,7 @@ impl AtomicDrmSurface {
             self.crtc,
             Some(pending.blob),
             pending.vrr,
+            &pending.connector_properties,
             &conns,
             removed,
             [&plane_state],
@@ -532,6 +540,7 @@ impl AtomicDrmSurface {
             self.crtc,
             Some(new_blob),
             pending.vrr,
+            &pending.connector_properties,
             pending.connectors.iter(),
             [],
             [&plane_state],
@@ -655,6 +664,7 @@ impl AtomicDrmSurface {
             self.crtc,
             Some(pending.blob),
             value,
+            &pending.connector_properties,
             &pending.connectors,
             &[],
             [&plane_config],
@@ -687,6 +697,35 @@ impl AtomicDrmSurface {
 
     pub fn commit_pending(&self) -> bool {
         *self.pending.read().unwrap() != *self.state.read().unwrap()
+    }
+
+    pub fn set_connector_property(
+        &self,
+        conn: connector::Handle,
+        name: &'static str,
+        value: property::Value<'static>,
+    ) -> Result<(), Error> {
+        // Fail early for a property the connector does not have.
+        self.prop_mapping.read().unwrap().conn_prop_handle(conn, name)?;
+        self.pending
+            .write()
+            .unwrap()
+            .connector_properties
+            .insert((conn, name), value);
+        Ok(())
+    }
+
+    pub fn connector_property(
+        &self,
+        conn: connector::Handle,
+        name: &'static str,
+    ) -> Option<property::Value<'static>> {
+        self.pending
+            .read()
+            .unwrap()
+            .connector_properties
+            .get(&(conn, name))
+            .copied()
     }
 
     #[instrument(level = "trace", parent = &self.span, skip(self, planes))]
@@ -725,6 +764,7 @@ impl AtomicDrmSurface {
             self.crtc,
             Some(pending.blob),
             pending.vrr,
+            &pending.connector_properties,
             &pending_conns,
             removed,
             &*planes,
@@ -797,6 +837,7 @@ impl AtomicDrmSurface {
                 self.crtc,
                 Some(pending.blob),
                 pending.vrr,
+                &pending.connector_properties,
                 &pending_conns,
                 removed,
                 &*planes,
@@ -884,6 +925,7 @@ impl AtomicDrmSurface {
             self.crtc,
             None,
             self.state.read().unwrap().vrr,
+            &HashMap::new(),
             [],
             [],
             &*planes,
@@ -1152,6 +1194,17 @@ impl<'a> AtomicRequest<'a> {
         Ok(())
     }
 
+    fn set_connector_property(
+        &mut self,
+        conn: connector::Handle,
+        name: &'static str,
+        value: property::Value<'static>,
+    ) -> Result<(), Error> {
+        self.mapping.conn_prop_handle(conn, name)?;
+        self.connector_props.entry(conn).or_default().insert(name, value);
+        Ok(())
+    }
+
     fn set_crtc(
         &mut self,
         crtc: crtc::Handle,
@@ -1351,6 +1404,17 @@ impl<'a> AtomicRequest<'a> {
             self.mapping.conn_prop_handle(conn, "CRTC_ID")?,
             property::Value::CRTC(None),
         );
+        Ok(())
+    }
+
+    fn set_connector_property(
+        &mut self,
+        conn: connector::Handle,
+        name: &'static str,
+        value: property::Value<'static>,
+    ) -> Result<(), Error> {
+        self.request
+            .add_property(conn, self.mapping.conn_prop_handle(conn, name)?, value);
         Ok(())
     }
 
@@ -1612,6 +1676,7 @@ impl<'a> AtomicRequest<'a> {
         crtc: crtc::Handle,
         blob: Option<property::Value<'static>>,
         vrr: bool,
+        connector_properties: &HashMap<(connector::Handle, &'static str), property::Value<'static>>,
         connectors: impl IntoIterator<Item = &'a connector::Handle>,
         removed_connectors: impl IntoIterator<Item = &'a connector::Handle>,
         planes: impl IntoIterator<Item = &'a PlaneState<'a>>,
@@ -1624,6 +1689,10 @@ impl<'a> AtomicRequest<'a> {
         // for every connector that is new, we need to set our crtc_id
         for conn in connectors {
             req.set_connector(*conn, crtc)?;
+            // and any properties set for it, such as its colorspace
+            for ((_, name), value) in connector_properties.iter().filter(|((c, _), _)| c == conn) {
+                req.set_connector_property(*conn, name, *value)?;
+            }
         }
 
         // for every connector that got removed, we need to set no crtc_id.
