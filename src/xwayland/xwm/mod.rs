@@ -264,6 +264,7 @@ mod atoms {
             _NET_WM_STATE_MAXIMIZED_HORZ,
             _NET_WM_STATE_HIDDEN,
             _NET_WM_STATE_FULLSCREEN,
+            _NET_WM_FULLSCREEN_MONITORS,
             _NET_WM_STATE_DEMANDS_ATTENTION,
             _NET_WM_STATE_FOCUSED,
             _NET_WM_STATE_ABOVE,
@@ -437,6 +438,22 @@ pub trait XwmHandler {
     /// Window requests to be unfullscreened.
     fn unfullscreen_request(&mut self, xwm: XwmId, window: X11Surface) {
         let _ = (xwm, window);
+    }
+    /// Window requests the monitors to cover when it is fullscreen
+    /// (`_NET_WM_FULLSCREEN_MONITORS`).
+    ///
+    /// `monitors` holds the logical geometries of the monitors the window's
+    /// top, bottom, left, and right edges should align with, resolved from the
+    /// client's Xinerama indices through the RandR monitor list. The window's
+    /// `_NET_WM_FULLSCREEN_MONITORS` property has already been updated. This
+    /// request does not make the window fullscreen by itself.
+    fn fullscreen_monitors_request(
+        &mut self,
+        xwm: XwmId,
+        window: X11Surface,
+        monitors: [Rectangle<i32, Logical>; 4],
+    ) {
+        let _ = (xwm, window, monitors);
     }
     /// Window requests to be set as a modal dialog (see [`X11Surface::is_modal`]).
     fn modal_request(&mut self, xwm: XwmId, window: X11Surface) {
@@ -906,6 +923,7 @@ impl X11Wm {
             atoms._NET_WM_STATE_MAXIMIZED_VERT,
             atoms._NET_WM_STATE_HIDDEN,
             atoms._NET_WM_STATE_FULLSCREEN,
+            atoms._NET_WM_FULLSCREEN_MONITORS,
             atoms._NET_WM_STATE_MODAL,
             atoms._NET_WM_STATE_FOCUSED,
             atoms._NET_WM_STATE_ABOVE,
@@ -2681,6 +2699,47 @@ where
                                 }
                             }
                             _ => {}
+                        }
+                    }
+                }
+                x if x == xwm.atoms._NET_WM_FULLSCREEN_MONITORS => {
+                    let data = msg.data.as_data32();
+                    let indices = [data[0], data[1], data[2], data[3]];
+                    if let Some(surface) = xwm.windows.iter().find(|x| x.window_id() == msg.window).cloned() {
+                        // Xwayland numbers Xinerama screens in the order of
+                        // RandR's active monitor list.
+                        let monitors = conn.randr_get_monitors(xwm.screen.root, true)?.reply()?.monitors;
+                        let client_scale = xwm.client_scale.load(Ordering::Acquire);
+                        let resolved = indices.map(|index| {
+                            monitors.get(index as usize).map(|m| {
+                                Rectangle::<i32, Client>::new(
+                                    (m.x as i32, m.y as i32).into(),
+                                    (m.width as i32, m.height as i32).into(),
+                                )
+                                .to_f64()
+                                .to_logical(client_scale)
+                                .to_i32_round()
+                            })
+                        });
+                        if let [Some(top), Some(bottom), Some(left), Some(right)] = resolved {
+                            // EWMH: the window manager keeps the property current.
+                            conn.change_property32(
+                                PropMode::REPLACE,
+                                msg.window,
+                                xwm.atoms._NET_WM_FULLSCREEN_MONITORS,
+                                AtomEnum::CARDINAL,
+                                &indices,
+                            )?;
+                            conn.flush()?;
+                            drop(_guard);
+                            state.fullscreen_monitors_request(xwm_id, surface, [top, bottom, left, right]);
+                        } else {
+                            debug!(
+                                window = msg.window,
+                                ?indices,
+                                monitors = monitors.len(),
+                                "X11: ignoring _NET_WM_FULLSCREEN_MONITORS with an unknown monitor index"
+                            );
                         }
                     }
                 }
