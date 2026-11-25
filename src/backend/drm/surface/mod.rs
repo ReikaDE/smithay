@@ -351,6 +351,44 @@ impl DrmSurface {
         }
     }
 
+    /// Sets a property of one of the surface's connectors for the next commit,
+    /// for example `Colorspace`, `HDR_OUTPUT_METADATA`, or `max bpc`.
+    ///
+    /// Doing so causes [`DrmSurface::commit_pending`] to return `true` when the
+    /// value differs from the committed one, and the next [`DrmSurface::commit`]
+    /// is then allowed to modeset. A blob value, such as HDR metadata, must
+    /// stay alive until it has been replaced by a later commit.
+    ///
+    /// Errors with [`Error::UnknownProperty`] if the connector does not have the
+    /// property, or if the underlying implementation is using the legacy DRM api.
+    pub fn set_connector_property(
+        &self,
+        conn: connector::Handle,
+        name: &'static str,
+        value: drm::control::property::Value<'static>,
+    ) -> Result<(), Error> {
+        match &*self.internal {
+            DrmSurfaceInternal::Atomic(surf) => surf.set_connector_property(conn, name, value),
+            DrmSurfaceInternal::Legacy(_) => Err(Error::UnknownProperty {
+                handle: conn.into(),
+                name,
+            }),
+        }
+    }
+
+    /// Returns the value set for a connector property with
+    /// [`DrmSurface::set_connector_property`], if any.
+    pub fn connector_property(
+        &self,
+        conn: connector::Handle,
+        name: &'static str,
+    ) -> Option<drm::control::property::Value<'static>> {
+        match &*self.internal {
+            DrmSurfaceInternal::Atomic(surf) => surf.connector_property(conn, name),
+            DrmSurfaceInternal::Legacy(_) => None,
+        }
+    }
+
     /// Disables the given plane.
     ///
     /// Errors if the plane is not supported by this crtc or if the underlying
