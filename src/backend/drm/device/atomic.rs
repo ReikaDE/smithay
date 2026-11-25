@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::os::unix::io::AsFd;
 use std::sync::{
     Arc, RwLock,
     atomic::{AtomicBool, Ordering},
@@ -6,22 +7,40 @@ use std::sync::{
 
 use drm::control::atomic::AtomicModeReq;
 use drm::control::{
-    AtomicCommitFlags, Device as ControlDevice, PropertyValueSet, ResourceHandle, connector, crtc,
-    framebuffer, plane, property,
+    AtomicCommitFlags, Device as ControlDevice, RawResourceHandle, ResourceHandle, connector, crtc, plane,
+    property,
 };
 
 use super::DrmDeviceFd;
 use crate::backend::drm::error::AccessError;
 use crate::{backend::drm::error::Error, utils::DevPath};
 
-use tracing::{debug, error, info_span, trace};
+use tracing::{debug, error, info_span, trace, warn};
 
-type OldState = (
-    Vec<(connector::Handle, PropertyValueSet)>,
-    Vec<(crtc::Handle, PropertyValueSet)>,
-    Vec<(framebuffer::Handle, PropertyValueSet)>,
-    Vec<(plane::Handle, PropertyValueSet)>,
-);
+/// A property value saved to restore the device's previous state.
+#[derive(Debug, Clone)]
+enum SavedValue {
+    Raw(property::RawValue),
+    /// Contents of a blob, such as a mode or a gamma table. The blob itself
+    /// may be freed by the time the state is restored, for example once a
+    /// modeset has replaced the mode it held, so a new one is created from
+    /// these contents instead.
+    Blob(Vec<u8>),
+}
+
+/// The properties of one DRM object when the device was opened.
+#[derive(Debug, Clone)]
+struct SavedObject {
+    handle: RawResourceHandle,
+    /// The object type, as `DRM_MODE_OBJECT_*`, for reading its properties
+    /// again on restore.
+    kind: u32,
+    props: Vec<(property::Handle, SavedValue)>,
+}
+
+/// The state of the device when it was opened, limited to the properties
+/// that can be written back in an atomic commit.
+type OldState = Vec<SavedObject>;
 
 #[derive(Clone, Debug, Default)]
 pub struct PropMapping {
@@ -95,7 +114,7 @@ impl AtomicDrmDevice {
         let mut dev = AtomicDrmDevice {
             fd,
             active,
-            old_state: (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+            old_state: Vec::new(),
             prop_mapping: Default::default(),
             span,
         };
@@ -123,10 +142,9 @@ impl AtomicDrmDevice {
 
         // This helper function takes a snapshot of the current device properties.
         // (everything in the atomic api is set via properties.)
-        add_props(&dev.fd, res_handles.connectors(), &mut old_state.0)?;
-        add_props(&dev.fd, res_handles.crtcs(), &mut old_state.1)?;
-        add_props(&dev.fd, res_handles.framebuffers(), &mut old_state.2)?;
-        add_props(&dev.fd, &planes, &mut old_state.3)?;
+        add_props(&dev.fd, res_handles.connectors(), &mut old_state)?;
+        add_props(&dev.fd, res_handles.crtcs(), &mut old_state)?;
+        add_props(&dev.fd, &planes, &mut old_state)?;
 
         // And because the mapping is not consistent across devices,
         // we also need to lookup the handle for a property name.
@@ -246,63 +264,149 @@ impl Drop for AtomicDrmDevice {
             // We do exit correctly if this fails, but the user will be presented with
             // a black screen if no display handler takes control again.
 
-            // create an atomic mode request consisting of all properties we captured on creation.
+            // Create an atomic mode request with every captured property whose
+            // value has changed since the device was opened. Leaving out the
+            // unchanged ones makes no difference to the resulting state, and
+            // avoids driver properties that cannot be written back with their
+            // own value: NVIDIA rejects any commit that sets `NV_HDCP_LEVEL` to
+            // the value it reports, which made the whole restore fail.
             // TODO, check current connector status and remove deactivated connectors from this req.
 
             debug!("Device still active, trying to restore previous state");
             let mut req = AtomicModeReq::new();
-            fn add_multiple_props<T: ResourceHandle>(
-                req: &mut AtomicModeReq,
-                old_state: &[(T, PropertyValueSet)],
-            ) {
-                for (handle, set) in old_state {
-                    let (prop_handles, values) = set.as_props_and_values();
-                    for (&prop_handle, &val) in prop_handles.iter().zip(values.iter()) {
-                        req.add_raw_property((*handle).into(), prop_handle, val);
-                    }
+            let mut blobs = Vec::new();
+            let mut changed = 0usize;
+            for object in &self.old_state {
+                // If the current values cannot be read, write back everything.
+                let current = current_values(&self.fd, object).unwrap_or_default();
+                for (prop, value) in &object.props {
+                    let now = current.get(prop).copied();
+                    let value = match value {
+                        SavedValue::Raw(value) => {
+                            if now == Some(*value) {
+                                continue;
+                            }
+                            *value
+                        }
+                        SavedValue::Blob(data) => {
+                            if let Some(id) = now.filter(|id| *id != 0)
+                                && self.fd.get_property_blob(id).is_ok_and(|now| now == *data)
+                            {
+                                continue;
+                            }
+                            let mut data = data.clone();
+                            match drm_ffi::mode::create_property_blob(self.fd.as_fd(), &mut data) {
+                                Ok(blob) => {
+                                    blobs.push(blob.blob_id);
+                                    blob.blob_id as property::RawValue
+                                }
+                                Err(err) => {
+                                    warn!(?prop, "Failed to re-create property blob: {}", err);
+                                    continue;
+                                }
+                            }
+                        }
+                    };
+                    req.add_raw_property(object.handle, *prop, value);
+                    changed += 1;
                 }
             }
 
-            add_multiple_props(&mut req, &self.old_state.0);
-            add_multiple_props(&mut req, &self.old_state.1);
-            add_multiple_props(&mut req, &self.old_state.2);
-            add_multiple_props(&mut req, &self.old_state.3);
-
-            trace!("Previous state: {:?}", req);
+            if changed == 0 {
+                debug!("Previous state is unchanged, nothing to restore");
+                return;
+            }
+            trace!("Previous state ({} changed properties): {:?}", changed, req);
             if let Err(err) = self.fd.atomic_commit(AtomicCommitFlags::ALLOW_MODESET, req) {
                 error!("Failed to restore previous state. Error: {}", err);
+            }
+            // The committed state holds its own references to the blobs.
+            for blob in blobs {
+                let _ = drm_ffi::mode::destroy_property_blob(self.fd.as_fd(), blob);
             }
         }
     }
 }
 
-// Add all properties of given handles to a given drm resource type to state.
-// You may use this to snapshot the current state of the drm device (fully or partially).
-fn add_props<D, T>(fd: &D, handles: &[T], state: &mut Vec<(T, PropertyValueSet)>) -> Result<(), Error>
+// Add the properties of the given handles to a snapshot of the device state.
+//
+// Only properties that can be written back in an atomic commit are kept:
+// immutable properties (such as `EDID` or `IN_FORMATS`), the legacy-only
+// `DPMS`, and `FB_DAMAGE_CLIPS`, which describes a single past commit, are
+// left out, because the kernel rejects a request containing any of them.
+// Blob properties are saved by content, since the blobs may be freed by the
+// time the snapshot is restored. On restore, only the properties whose value
+// has changed are written back.
+fn add_props<D, T>(fd: &D, handles: &[T], state: &mut OldState) -> Result<(), Error>
 where
     D: DevPath + ControlDevice,
     T: ResourceHandle,
 {
-    let iter = handles.iter().map(|x| (x, fd.get_properties(*x)));
-    if let Some(len) = iter.size_hint().1 {
-        state.reserve_exact(len)
-    }
+    let access_error = |source| {
+        Error::Access(AccessError {
+            errmsg: "Error reading properties",
+            dev: fd.dev_path(),
+            source,
+        })
+    };
 
-    iter.map(|(x, y)| (*x, y))
-        .try_for_each(|(x, y)| match y {
-            Ok(y) => {
-                state.push((x, y));
-                Ok(())
+    state.reserve(handles.len());
+    for handle in handles {
+        let set = fd.get_properties(*handle).map_err(access_error)?;
+        let (prop_handles, values) = set.as_props_and_values();
+        let mut saved = Vec::with_capacity(prop_handles.len());
+        for (prop, value) in prop_handles.iter().zip(values) {
+            let info = fd.get_property(*prop).map_err(access_error)?;
+            let name = info.name().to_bytes();
+            if !info.mutable() || name == b"DPMS" || name == b"FB_DAMAGE_CLIPS" {
+                continue;
             }
-            Err(err) => Err(err),
+            let value = match info.value_type() {
+                property::ValueType::Blob if *value != 0 => match fd.get_property_blob(*value) {
+                    Ok(data) => SavedValue::Blob(data),
+                    Err(err) => {
+                        warn!(
+                            ?prop,
+                            "Failed to read property blob, it will not be restored: {}", err
+                        );
+                        continue;
+                    }
+                },
+                _ => SavedValue::Raw(*value),
+            };
+            saved.push((*prop, value));
+        }
+        state.push(SavedObject {
+            handle: (*handle).into(),
+            kind: T::FFI_TYPE,
+            props: saved,
+        });
+    }
+    Ok(())
+}
+
+// The current property values of a saved object.
+fn current_values(
+    fd: &DrmDeviceFd,
+    object: &SavedObject,
+) -> std::io::Result<HashMap<property::Handle, property::RawValue>> {
+    let mut props = Vec::new();
+    let mut values = Vec::new();
+    drm_ffi::mode::get_properties(
+        fd.as_fd(),
+        object.handle.get(),
+        object.kind,
+        Some(&mut props),
+        Some(&mut values),
+    )?;
+    Ok(props
+        .into_iter()
+        .zip(values)
+        .filter_map(|(prop, value)| {
+            let prop = property::Handle::from(RawResourceHandle::new(prop)?);
+            Some((prop, value))
         })
-        .map_err(|source| {
-            Error::Access(AccessError {
-                errmsg: "Error reading properties",
-                dev: fd.dev_path(),
-                source,
-            })
-        })
+        .collect())
 }
 
 /// Create a mapping of property names and handles for given handles of a given drm resource type.
