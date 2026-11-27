@@ -760,6 +760,20 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
         )
     }
 
+    /// Flips only the primary plane's buffer, without waiting for the
+    /// vertical blank (see [`DrmSurface::page_flip_async`]).
+    #[profiling::function]
+    fn page_flip_async(
+        &mut self,
+        surface: &DrmSurface,
+        event: bool,
+    ) -> Result<(), crate::backend::drm::error::Error> {
+        debug_assert!(!self.planes.iter().any(|(_, state)| state.needs_test));
+        // No fences: the async request carries the framebuffer only, and the
+        // kernel waits for the buffer's implicit fences itself.
+        surface.page_flip_async(self.build_planes(surface, false, false), event)
+    }
+
     #[profiling::function]
     fn build_planes<'a>(
         &'a mut self,
@@ -994,6 +1008,8 @@ enum PreparedFrameKind {
 struct PreparedFrame<A: Allocator, F: ExportFramebuffer<<A as Allocator>::Buffer>> {
     frame: CompositorFrameState<A, F>,
     kind: PreparedFrameKind,
+    /// Rendered with [`FrameFlags::ALLOW_TEARING`].
+    allow_tearing: bool,
 }
 
 impl<A: Allocator, F: ExportFramebuffer<<A as Allocator>::Buffer>> PreparedFrame<A, F> {
@@ -1036,6 +1052,11 @@ bitflags::bitflags! {
         const ALLOW_CURSOR_PLANE_SCANOUT = 8;
         /// Return `EmptyFrame`, if only the cursor plane would have been updated
         const SKIP_CURSOR_ONLY_UPDATES = 16;
+        /// Allow the frame to be shown without waiting for the vertical blank
+        /// (an async page flip), so it may tear. Used only when the driver
+        /// supports async flips and nothing but the primary plane's buffer
+        /// changes; otherwise the frame flips as usual.
+        const ALLOW_TEARING = 32;
         /// Allow to realize the frame by assigning elements on any plane
         const ALLOW_SCANOUT = Self::ALLOW_PRIMARY_PLANE_SCANOUT.bits() | Self::ALLOW_OVERLAY_PLANE_SCANOUT.bits() | Self::ALLOW_CURSOR_PLANE_SCANOUT.bits();
         /// Safe default set of flags
@@ -2404,6 +2425,7 @@ where
                 PreparedFrameKind::Full
             },
             frame: next_frame_state,
+            allow_tearing: frame_flags.contains(FrameFlags::ALLOW_TEARING),
         };
         let frame_reference: RenderFrameResult<'a, A::Buffer, F::Framebuffer, E> = RenderFrameResult {
             is_empty: next_frame.is_empty(),
@@ -2549,6 +2571,23 @@ where
         } = self.queued_frame.take().unwrap();
 
         let allow_partial_update = prepared_frame.kind == PreparedFrameKind::Partial;
+        if self.can_flip_async(&prepared_frame) {
+            match prepared_frame.frame.page_flip_async(&self.surface, true) {
+                Ok(()) => {
+                    let res = self.handle_flip(&prepared_frame, Ok(()));
+                    if res.is_ok() {
+                        self.pending_frame = Some(PendingFrame {
+                            frame: prepared_frame.frame,
+                            user_data,
+                        });
+                    }
+                    return res;
+                }
+                // The driver refused (a buffer it cannot flip to that way,
+                // for one): show this frame with a normal flip instead.
+                Err(err) => trace!(?err, "async page flip refused, flipping on the vertical blank"),
+            }
+        }
         let flip = if self.surface.commit_pending() {
             prepared_frame
                 .frame
@@ -2569,6 +2608,36 @@ where
         }
 
         res
+    }
+
+    /// Whether a frame can be shown with an async page flip: asked for, the
+    /// driver supports it, no modeset is pending, and the only change is a
+    /// new buffer on the primary plane, at the same position, size,
+    /// transform, alpha, and format as the buffer shown now.
+    fn can_flip_async(&self, prepared: &PreparedFrame<A, F>) -> bool {
+        if !prepared.allow_tearing
+            || prepared.kind != PreparedFrameKind::Partial
+            || !self.surface.supports_async_page_flip()
+            || self.surface.commit_pending()
+        {
+            return false;
+        }
+        let primary = self.surface.plane();
+        let current = self
+            .current_frame
+            .plane_state(primary)
+            .and_then(|state| state.config.as_ref());
+        prepared.frame.planes.iter().all(|(handle, state)| {
+            if *handle != primary {
+                return state.skip;
+            }
+            match (state.config.as_ref(), current) {
+                (Some(new), Some(current)) => {
+                    !state.skip && new.properties.is_compatible(&current.properties)
+                }
+                _ => false,
+            }
+        })
     }
 
     fn handle_flip(

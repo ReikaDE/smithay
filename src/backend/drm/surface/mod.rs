@@ -487,6 +487,34 @@ impl DrmSurface {
         }
     }
 
+    /// Whether the surface can flip without waiting for the vertical blank
+    /// ([`DrmSurface::page_flip_async`]). Always false on the legacy API.
+    pub fn supports_async_page_flip(&self) -> bool {
+        match &*self.internal {
+            DrmSurfaceInternal::Atomic(surf) => surf.supports_async_page_flip(),
+            DrmSurfaceInternal::Legacy(_) => false,
+        }
+    }
+
+    /// Flips the primary plane to a new framebuffer without waiting for the
+    /// vertical blank, so the change may tear (games asking for it through
+    /// `wp_tearing_control_v1`). Only valid when nothing but the primary
+    /// plane's framebuffer changes; errors otherwise, or when the driver
+    /// refuses, and the caller then flips as usual.
+    ///
+    /// Produces a `vblank` event like [`DrmSurface::page_flip`] when `event` is set.
+    #[profiling::function]
+    pub fn page_flip_async<'a>(
+        &self,
+        planes: impl IntoIterator<Item = PlaneState<'a>>,
+        event: bool,
+    ) -> Result<(), Error> {
+        match &*self.internal {
+            DrmSurfaceInternal::Atomic(surf) => surf.page_flip_async(planes, event),
+            DrmSurfaceInternal::Legacy(_) => Err(Error::NoFramebuffer(self.plane())),
+        }
+    }
+
     /// Returns a set of available planes for this surface
     pub fn planes(&self) -> &Planes {
         &self.planes

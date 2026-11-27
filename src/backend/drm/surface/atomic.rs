@@ -176,6 +176,9 @@ pub struct AtomicDrmSurface {
     prop_mapping: Arc<RwLock<PropMapping>>,
     state: RwLock<State>,
     pending: RwLock<State>,
+    /// The driver accepts async page flips through the atomic API
+    /// (`DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP`).
+    async_page_flip: bool,
     pub(super) span: tracing::Span,
 }
 
@@ -214,6 +217,11 @@ impl AtomicDrmSurface {
             connector_properties: HashMap::new(),
         };
 
+        let async_page_flip =
+            drm::Device::get_driver_capability(&*fd, drm::DriverCapability::AtomicASyncPageFlip)
+                .is_ok_and(|v| v != 0);
+        debug!(async_page_flip, "async page flip support");
+
         drop(_guard);
         let surface = AtomicDrmSurface {
             fd,
@@ -224,6 +232,7 @@ impl AtomicDrmSurface {
             prop_mapping,
             state: RwLock::new(state),
             pending: RwLock::new(pending),
+            async_page_flip,
             span,
         };
 
@@ -964,6 +973,55 @@ impl AtomicDrmSurface {
         }
 
         res
+    }
+
+    /// Whether the driver accepts async page flips through the atomic API.
+    pub fn supports_async_page_flip(&self) -> bool {
+        self.async_page_flip
+    }
+
+    /// Flips the primary plane to a new framebuffer without waiting for the
+    /// vertical blank, so the change may tear.
+    ///
+    /// Only the primary plane's `FB_ID` is sent: the kernel refuses an async
+    /// commit that changes anything else, so every other plane property must
+    /// already be what `planes` describes. Callers check that and fall back
+    /// to [`AtomicDrmSurface::page_flip`] when this fails.
+    #[instrument(level = "trace", parent = &self.span, skip(self, planes))]
+    #[profiling::function]
+    pub fn page_flip_async<'a>(
+        &self,
+        planes: impl IntoIterator<Item = PlaneState<'a>>,
+        event: bool,
+    ) -> Result<(), Error> {
+        if !self.active.load(Ordering::SeqCst) {
+            return Err(Error::DeviceInactive);
+        }
+        let fb = planes
+            .into_iter()
+            .find(|p| p.handle == self.plane)
+            .and_then(|p| p.config.map(|c| c.fb))
+            .ok_or(Error::NoFramebuffer(self.plane))?;
+
+        let prop_mapping = self.prop_mapping.read().unwrap();
+        let mut req = AtomicModeReq::new();
+        req.add_property(
+            self.plane,
+            prop_mapping.plane_prop_handle(self.plane, "FB_ID")?,
+            property::Value::Framebuffer(Some(fb)),
+        );
+        let mut flags = AtomicCommitFlags::PAGE_FLIP_ASYNC | AtomicCommitFlags::NONBLOCK;
+        if event {
+            flags |= AtomicCommitFlags::PAGE_FLIP_EVENT;
+        }
+        trace!(?fb, "Queueing async page flip");
+        self.fd.atomic_commit(flags, req).map_err(|source| {
+            Error::Access(AccessError {
+                errmsg: "Async page flip commit failed",
+                dev: self.fd.dev_path(),
+                source,
+            })
+        })
     }
 
     // this helper function disconnects the plane.
